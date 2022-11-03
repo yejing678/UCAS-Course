@@ -4,19 +4,20 @@ import time
 import random
 import math
 import numpy as np
+import copy
 import torch
 import torch.nn
 import logging
+from pathlib import Path
 
 from tqdm import tqdm
 from argparse import ArgumentParser
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
 from data_utils.io_utils import *
-from data_utils.vocab_utils import Vocabulary
-from data_utils.prepare_data import prepare_data
 from models import *
-from data_utils.data import Corpus
+from data_utils.data import create_batch_fnn, create_batch_rnn, data_prepare
+from train_picture import plot_jasons_lineplot
 
 sys.path.append(os.pardir)
 
@@ -61,12 +62,14 @@ class Instructor:
 
     def _train(self, criterion, optimizer, train_data_loader, val_data_loader):
         print("start training...")
+        update_num_list, train_loss_list, train_ppl_list, val_loss_list, val_ppl_list = [], [], [], [], []
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
-        min_val_ppl = float("inf")
+        min_val_ppl = float('inf')
         min_val_epoch = 0
+        best_model = None
+        global_step = 0
 
         for epoch in range(self.opt.epochs):
-            logger.info('>' * 100)
             start = time.time()
             total_loss = 0.0
             step = 0
@@ -76,11 +79,11 @@ class Instructor:
                     self.model.train()
                     x, y = batch
                     output = self.model(x)
-                    loss = criterion(output, y)
-                    loss = loss.mean()
+                    loss = criterion(output, y.view(-1))
                     loss.backward()
                     total_loss += loss.item()
                     step += 1
+                    global_step += 1
                     # ppl stand for perplexity
                     pbar.set_postfix({'loss': total_loss / step, 'ppl': np.exp(total_loss / step),
                                       'lr': optimizer.state_dict()['param_groups'][0]['lr']})
@@ -96,14 +99,19 @@ class Instructor:
                             for batch_val in val_data_loader:
                                 x_val, y_val = batch_val
                                 output_val = self.model(x_val)
-                                loss = criterion(output_val, y_val)
-                                loss = loss.mean()
+                                loss = criterion(output_val, y_val.view(-1))
                                 val_loss += loss.item()
                                 val_step += 1
                         average_loss = val_loss / val_step
-                        val_ppl = np.exp(average_loss)
-                        logger.info("\n model at step {}, nll loss:{}, ppl: {}".format(step, average_loss, val_ppl))
-
+                        val_ppl = math.exp(average_loss)
+                        print('\n')
+                        logger.info("| epoch {:3d} | step {:6d} | nnl loss {:5.3f} | val_ppl {:8.3f} "
+                                    .format(epoch + 1, step, average_loss, val_ppl))
+                        update_num_list.append(global_step)
+                        train_loss_list.append(total_loss / step)
+                        train_ppl_list.append(np.exp(total_loss / step))
+                        val_ppl_list.append(val_ppl)
+                        val_loss_list.append(average_loss)
                         if val_ppl < min_val_ppl:
                             min_val_ppl = val_ppl
                             min_val_epoch = epoch
@@ -111,34 +119,68 @@ class Instructor:
                             dirname = os.path.dirname(save_path)
                             if not os.path.exists(dirname):
                                 os.makedirs(dirname)
-
                             path = save_path + 'epoch {0}_step {1}_ppl {2}' \
                                 .format(epoch, step, round(val_ppl, 4))
                             if epoch > 0:
+                                best_model = copy.deepcopy(self.model)
                                 # timestamp = datetime.datetime.now().strftime('%Y-%m-%d%H%M%S')
                                 torch.save(self.model.state_dict(), path)
                                 logger.info('>> saved: {}'.format(path))
 
             end = time.time()
-            logger.info('time: {:.4f}s'.format(end - start))
+            logger.info('-' * 120)
+            logger.info(
+                '| end of epoch {:3d} | time: {:.4f}s | valid loss {:.4f} | valid ppl {:.4f}'.
+                format(epoch + 1, end - start, average_loss, val_ppl))
+            logger.info('-' * 120)
+
             if epoch - min_val_epoch >= opt.patience:
                 logger.info('>> early stop.')
                 break
 
-        logger.info('>> min_val_acc: {:.4f}'.format(min_val_ppl))
-        return path
+            # draw picture
+            save_picture_path = "plots/model-{}/batch_size-{}/window_size-{}/seed-{}". \
+                format(self.opt.model_name, self.opt.batch_size, self.opt.window_size, self.opt.seed)
+            picture_dirname = os.path.dirname(save_picture_path)
+            if not os.path.exists(picture_dirname):
+                os.makedirs(picture_dirname)
+            train_loss_path = save_picture_path + 'train_loss.jpg'
+            train_ppl_path = save_picture_path + 'train_ppl.jpg'
+            val_loss_path = save_picture_path + 'val_loss.jpg'
+            val_ppl_path = save_picture_path + 'val_ppl.jpg'
+
+            plot_jasons_lineplot(update_num_list, train_loss_list, 'updates', 'training loss',
+                                 f"{self.opt.model_name}  min_train_loss={min(train_loss_list):.3f}",
+                                 train_loss_path)
+            plot_jasons_lineplot(update_num_list, val_loss_list, 'updates', 'validation loss',
+                                 f"{self.opt.model_name}  min_val_loss={min(val_loss_list):.3f}",
+                                 val_loss_path)
+            plot_jasons_lineplot(update_num_list, train_ppl_list, 'updates', 'train perplexity',
+                                 f"{self.opt.model_name}  min_train_ppl={min(train_ppl_list):.3f}",
+                                 train_ppl_path)
+            plot_jasons_lineplot(update_num_list, train_ppl_list, 'updates', 'val perplexity',
+                                 f"{self.opt.model_name}  min_val_ppl={min(val_ppl_list):.3f}",
+                                 val_ppl_path)
+
+        logger.info('>> min_val_ppl: {:.4f}'.format(min_val_ppl))
+        return path, best_model
 
     def _evaluate_ppl(self, criterion, data_loader):
         # switch model to evaluation mode
-        # self.model.eval()
+        self.model.eval()
+        total_loss = 0.0
+        step = 0
         with torch.no_grad():
-            for batch in data_loader:
-                x, y = batch
-                output = self.model(x)
-                loss = criterion(output, y)
-        val_ppl = np.exp(loss)
-        logger.info("\n nll loss:{}, ppl: {}".format(loss, val_ppl))
-        return val_ppl
+            for batch_test in data_loader:
+                step += 1
+                x_test, y_test = batch_test
+                output_test = self.model(x_test)
+                loss = criterion(output_test, y_test.view(-1))
+                loss.mean()
+                total_loss += loss.item()
+            average_loss = round(total_loss / step, 3)
+            test_ppl = round(np.exp(average_loss), 3)
+        return average_loss, test_ppl
 
     def run(self, train_data_loader, val_data_loader, test_data_loader):
         # Loss and Optimizer
@@ -147,79 +189,36 @@ class Instructor:
         optimizer = self.opt.optimizer(_params, lr=self.opt.lr, weight_decay=self.opt.l2reg, eps=1e-8)
 
         self._reset_params()
-        best_model_path = self._train(criterion, optimizer, train_data_loader, val_data_loader)
+        best_model_path, best_model = self._train(criterion, optimizer, train_data_loader, val_data_loader)
+        # best_model_path = "/home/jye/UCAS_Course/NLP/state_dict/lstm/42/epoch 4_step 6000_ppl 74.4185"
         logger.info('>> best_model_path: {}'.format(best_model_path))
+        print('loading best model...')
         self.model.load_state_dict(torch.load(best_model_path))
-        test_ppl = self._evaluate_ppl(criterion, test_data_loader)
-        logger.info('>> test_ppl: {:.4f}'.format(test_ppl))
+        loss, test_ppl = self._evaluate_ppl(criterion, test_data_loader)
+        logger.info("test nll loss:{:.3f}, ppl: {:.3f}".format(loss, test_ppl))
 
-
-def create_batch(d, batch_size, seq_len, device):
-    x = []
-    y = []
-
-    x = [d[i - seq_len:i] for i in range(seq_len, len(d))]
-    y = d[seq_len:]
-
-    x = torch.tensor(x, dtype=torch.long).to(device)
-    y = torch.tensor(y, dtype=torch.long).to(device)
-    dataset = TensorDataset(x, y)
-    dataloader = DataLoader(dataset, batch_size=batch_size)
-    return dataloader
-
-
-def data_prepare():
-    if not (os.path.isfile("./data/dict.json") and os.path.isfile("./data/train_input_ids") and os.path.isfile(
-            "./data/valid_input_ids") and os.path.isfile("./data/test_input_ids")):
-        my_corpus = Corpus(dic_path=None)
-        my_corpus.construct_dict("./data/data.txt")
-        with open("./data/data.txt", "r", encoding="utf-8") as f:
-            data = f.readlines()
-        train_data, valid_test_data = train_test_split(data, test_size=0.2, random_state=42)
-        valid_data, test_data = train_test_split(valid_test_data, test_size=0.5, random_state=42)
-        with open("./data/train_data.txt", "w", encoding="utf-8") as f:
-            f.writelines(train_data)
-        with open("./data/valid_data.txt", "w", encoding="utf-8") as f:
-            f.writelines(valid_data)
-        with open("./data/test_data.txt", "w", encoding="utf-8") as f:
-            f.writelines(test_data)
-
-        train_input_ids_flatten, valid_input_ids_flatten, test_input_ids_flatten = my_corpus.create_input_ids(
-            "./data")
-    else:
-        my_corpus = Corpus(dic_path="./data/dict.json")
-        train_input_ids_flatten, valid_input_ids_flatten, test_input_ids_flatten = torch.load(
-            "./data/train_input_ids_flatten"), torch.load("./data/valid_input_ids_flatten"), torch.load(
-            "./data/test_input_ids_flatten")
-    train_data_loader = create_batch(train_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.window_size,
-                                     device=opt.device)
-    val_data_loader = create_batch(valid_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.window_size,
-                                   device=opt.device)
-    test_data_loader = create_batch(test_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.window_size,
-                                    device=opt.device)
-    vocab_size = len(my_corpus.dictionary.word2idx)
-    return vocab_size, train_data_loader, val_data_loader, test_data_loader
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='fnn', help="fnn, lstm, self_attention")
-    parser.add_argument('--optimizer', default='adam', type=str)
+    parser.add_argument('--model_name', default='fnn', help="fnn, lstm, self_attention", type=str)
+    parser.add_argument('--optimizer', default='adamw', type=str)
     parser.add_argument('--initializer', default='xavier_uniform_', type=str)
-    parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--lr', default=1e-3, type=float, help='try 5e-5, 2e-5 for BERT, 1e-3 for others')
+    parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--lr', default=0.01, type=float)
     parser.add_argument('--dropout', default=0.1, type=float)
     parser.add_argument('--l2reg', default=1e-2, type=float)
-    parser.add_argument('--epochs', default=20, type=int, help='try larger number for non-BERT models')
-    parser.add_argument('--batch_size', default=16, type=int)
-    parser.add_argument('--log_step', default=10, type=int)
-    parser.add_argument('--embedding_dim', default=100, type=int)
-    parser.add_argument('--hidden_dim', default=100, type=int)
+    parser.add_argument('--epochs', default=40, type=int)
+    parser.add_argument('--batch_size', default=256, type=int)
+    parser.add_argument('--log_step', default=1000, type=int)
+    parser.add_argument('--embedding_dim', default=128, type=int)
+    parser.add_argument('--hidden_dim', default=128, type=int)
     parser.add_argument('--window_size', default=5, type=int)
+    parser.add_argument('--seq_len', default=5, type=int)
     parser.add_argument('--patience', default=8, type=int)
     parser.add_argument('--max_norm', default=1, type=int)
-    parser.add_argument('--device', default='cuda:0', type=str, help='e.g. cuda:0')
+    parser.add_argument('--num_layers', default=1, type=int)
+    parser.add_argument('--device', default='cuda:1', type=str, help='e.g. cuda:0')
     opt = parser.parse_args()
-
 
     if opt.seed is not None:
         random.seed(opt.seed)
@@ -229,13 +228,11 @@ if __name__ == '__main__':
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         os.environ['PYTHONHASHSEED'] = str(opt.seed)
-
     model_classes = {
         'fnn': FNN,
         'lstm': LSTM,
         'transformer': Transformer
     }
-
     initializers = {
         'xavier_uniform_': torch.nn.init.xavier_uniform_,
         'xavier_normal_': torch.nn.init.xavier_normal_,
@@ -249,6 +246,7 @@ if __name__ == '__main__':
         'asgd': torch.optim.ASGD,  # default lr=0.01
         'rmsprop': torch.optim.RMSprop,  # default lr=0.01
         'sgd': torch.optim.SGD,
+        'adamw': torch.optim.AdamW
     }
 
     opt.model_class = model_classes[opt.model_name]
@@ -256,11 +254,27 @@ if __name__ == '__main__':
     opt.optimizer = optimizers[opt.optimizer]
     opt.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') \
         if opt.device is None else torch.device(opt.device)
-
-    vocab_size, train_data_loader, val_data_loader, test_data_loader = data_prepare()
-    ins = Instructor(opt, vocab_size)
-    ins.run(train_data_loader, val_data_loader, test_data_loader)
-
-    log_file = 'train:{0}-{1}-{2}-{3}-{4}-{5}.log' \
-        .format(opt.model_name, opt.lr, opt.l2reg, opt.batch_size, opt.dropout, opt.seed)
+    log_file = 'train:{0}-{1}-{2}-{3}-{4}-{5}-{6}.log' \
+        .format(opt.model_name, opt.lr, opt.l2reg, opt.batch_size, opt.window_size, opt.dropout, opt.seed)
     logger.addHandler(logging.FileHandler(log_file))
+
+    vocab_size, train_input_ids_flatten, valid_input_ids_flatten, test_input_ids_flatten = data_prepare(opt)
+    if opt.model_name == 'fnn':
+        train_data_loader = create_batch_fnn(train_input_ids_flatten, batch_size=opt.batch_size,
+                                             seq_len=opt.window_size,
+                                             device=opt.device)
+        val_data_loader = create_batch_fnn(valid_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.window_size,
+                                           device=opt.device)
+        test_data_loader = create_batch_fnn(test_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.window_size,
+                                            device=opt.device)
+        ins = Instructor(opt, vocab_size)
+        ins.run(train_data_loader, val_data_loader, test_data_loader)
+    elif opt.model_name == 'lstm':
+        train_data_loader = create_batch_rnn(train_input_ids_flatten, batch_size=opt.batch_size,
+                                             seq_len=opt.seq_len, device=opt.device)
+        val_data_loader = create_batch_rnn(valid_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.seq_len,
+                                           device=opt.device)
+        test_data_loader = create_batch_rnn(test_input_ids_flatten, batch_size=opt.batch_size, seq_len=opt.seq_len,
+                                            device=opt.device)
+        ins = Instructor(opt, vocab_size)
+        ins.run(train_data_loader, val_data_loader, test_data_loader)
