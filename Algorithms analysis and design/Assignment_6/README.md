@@ -52,28 +52,28 @@
                dict = G[Q[0]]
 
 
-   # 优先队列法实现
-   def branch(G, v0):
-       Q.append(v0)
-       while len(Q) != 0:
-           min = 99999
-           flag = 0
-           # 找到队列中距离源点最近的点
-           for v in Q:
-               if min > length[v]:
-                   min = length[v]
-                   flag = v
-           head = flag
-           dict = G[head]
-           # 找到扩散点后进行松弛操作
-           for key in dict:
-               if length[head] + G[head][key] <= length[key]:
-                   length[key] = length[head] + G[head][key]
-                   Q.append(key)
-           # 松弛完毕后，该扩散点出队
-           Q.remove(head)
+     # 优先队列法实现
+     def branch(G, v0):
+         Q.append(v0)
+         while len(Q) != 0:
+             min = 99999
+             flag = 0
+             # 找到队列中距离源点最近的点
+             for v in Q:
+                 if min > length[v]:
+                     min = length[v]
+                     flag = v
+             head = flag
+             dict = G[head]
+             # 找到扩散点后进行松弛操作
+             for key in dict:
+                 if length[head] + G[head][key] <= length[key]:
+                     length[key] = length[head] + G[head][key]
+                     Q.append(key)
+             # 松弛完毕后，该扩散点出队
+             Q.remove(head)
 
 
-   branch(G, 1)
-   print(length)
+     branch(G, 1)
+     print(length)
 
